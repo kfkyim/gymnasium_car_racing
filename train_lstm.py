@@ -116,18 +116,34 @@ class Net(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, stride=1),  # (128, 3, 3)
             nn.ReLU(),  # activation
         )  # output shape (256, 1, 1)
-        self.v = nn.Sequential(nn.Linear(256, 100), nn.ReLU(), nn.Linear(100, 1))
-        self.fc = nn.Sequential(nn.Linear(256, 100), nn.ReLU())
-        self.alpha_head = nn.Sequential(nn.Linear(100, 3), nn.Softplus())
-        self.beta_head = nn.Sequential(nn.Linear(100, 3), nn.Softplus())
-        self.apply(self._weights_init)
+        self.lstm = nn.LSTM(256,128)
+        self.v = nn.Linear(128, 1)
+        self.alpha_head = nn.Sequential(nn.Linear(128, 3), nn.Softplus())
+        self.beta_head = nn.Sequential(nn.Linear(128, 3), nn.Softplus())
+        self.cnn_base.apply(self._cnn_weights_init)
+        self.lstm.apply(self._value_lstm_weights_init)
+        self.v.apply(self._value_lstm_weights_init)
+        self.alpha_head.apply(self._policy_weights_init)
+        self.beta_head.apply(self._policy_weights_init)
 
     @staticmethod
-    def _weights_init(m):
+    def _cnn_weights_init(m):
         if isinstance(m, nn.Conv2d):
-            nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('relu'))
+            nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0.1)
+                nn.init.constant_(m.bias, 0.0)
+
+    @staticmethod
+    def _value_lstm_weights_init(m):
+        nn.init.orthogonal_(m.weight, gain=1.0)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0) 
+
+    @staticmethod
+    def _policy_weights_init(m):
+        nn.init.orthogonal_(m.weight, gain=0.01)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0) 
 
     def forward(self, x):
         x = self.cnn_base(x)
