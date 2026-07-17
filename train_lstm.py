@@ -18,10 +18,9 @@ parser.add_argument('--params-path', type=str, default=None, help='path to the s
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='discount factor (default: 0.99)')
 parser.add_argument('--lambda_', type=float, default=0, metavar='G', help='GAE lambda factor (default: 0)')
 parser.add_argument('--lr', type=float, default=1e-4, metavar='G', help='learning rate of agent (default: 1e-4)')
-parser.add_argument('--action-repeat', type=int, default=8, metavar='N', help='repeat action in N frames (default: 8)')
-parser.add_argument('--img-stack', type=int, default=4, metavar='N', help='stack N image in a state (default: 4)')
+parser.add_argument('--action-repeat', type=int, default=4, metavar='N', help='repeat action in N frames (default: 8)')
 parser.add_argument('--seed', type=int, default=0, metavar='N', help='random seed (default: 0)')
-parser.add_argument('--render', action='store_true', help='render the environment')
+parser.add_argument('--render', action='store_true', default=False, help='render the environment')
 parser.add_argument('--vis', action='store_true', help='use visdom')
 parser.add_argument('--log-interval', type=int, default=1, metavar='N', help='interval between training status logs (default: 1)')
 parser.add_argument('--load-weights', action='store_true', help='load pre-trained weights')
@@ -36,8 +35,8 @@ if use_cuda:
     # torch.backends.cudnn.deterministic = True   # force cuDNN to pick a deterministic algorithm
     # torch.backends.cudnn.benchmark = False       # prevents the auto-tuner from overriding that choice and selecting a nondeterministic algorithm that would be faster
     
-transition = np.dtype([('s', np.float64, (args.img_stack, 96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
-                       ('r', np.float64), ('s_', np.float64, (args.img_stack, 96, 96)), ('die', np.int32), ('done', np.int32)])
+transition = np.dtype([('s', np.float64, (96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
+                       ('r', np.float64), ('s_', np.float64, (96, 96)), ('die', np.int32), ('done', np.int32)])
 
 class Env():
     """
@@ -54,8 +53,7 @@ class Env():
         self.counter = 0
         self.av_r = self.reward_memory()
         observation, _ = self.env.reset(seed=args.seed)
-        self.stack = [np.array(observation)] * args.img_stack  # four frames for decision
-        return np.array(self.stack)
+        return np.array(observation)
 
     def step(self, action):
         total_reward = 0
@@ -71,10 +69,7 @@ class Env():
             done = True if self.av_r(reward) <= -0.1 or trunc else False
             if done or die:
                 break
-        self.stack.pop(0)
-        self.stack.append(np.array(observation))
-        assert len(self.stack) == args.img_stack
-        return np.array(self.stack), total_reward, done, die
+        return np.array(observation), total_reward, done, die
 
     def render(self, *arg):
         self.env.render(*arg)
@@ -102,8 +97,8 @@ class Net(nn.Module):
 
     def __init__(self):
         super(Net, self).__init__()
-        self.cnn_base = nn.Sequential(  # input shape (4, 96, 96)
-            nn.Conv2d(args.img_stack, 8, kernel_size=4, stride=2),
+        self.cnn_base = nn.Sequential(  # input shape (1, 96, 96)
+            nn.Conv2d(1, 8, kernel_size=4, stride=2),
             nn.ReLU(),  # activation
             nn.Conv2d(8, 16, kernel_size=3, stride=2),  # (8, 47, 47)
             nn.ReLU(),  # activation
@@ -116,34 +111,69 @@ class Net(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, stride=1),  # (128, 3, 3)
             nn.ReLU(),  # activation
         )  # output shape (256, 1, 1)
-        self.lstm = nn.LSTM(256,128)
-        self.v = nn.Linear(128, 1)
-        self.alpha_head = nn.Sequential(nn.Linear(128, 3), nn.Softplus())
-        self.beta_head = nn.Sequential(nn.Linear(128, 3), nn.Softplus())
+        # input shape expected: (1, 256) --> use .view(-1, 256) for this in _get_states().
+        self.cnn_fc = nn.Sequential(nn.Linear(256, 128), nn.ReLU()) # output shape: (1, 128)
+        self.lstm = nn.LSTM(128, 64,batch_first=True)
+        self.v = nn.Linear(64, 1)
+        self.alpha_head = nn.Sequential(nn.Linear(64, 3), nn.Softplus())
+        self.beta_head = nn.Sequential(nn.Linear(64, 3), nn.Softplus())
         self.cnn_base.apply(self._cnn_weights_init)
-        self.lstm.apply(self._value_lstm_weights_init)
-        self.v.apply(self._value_lstm_weights_init)
+        self.cnn_fc.apply(self._cnn_weights_init)
+        
+        for name, param in self.lstm.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, 1.0)
+        self.v.apply(self._value_weights_init)
         self.alpha_head.apply(self._policy_weights_init)
         self.beta_head.apply(self._policy_weights_init)
 
     @staticmethod
     def _cnn_weights_init(m):
-        if isinstance(m, nn.Conv2d):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0.0)
 
     @staticmethod
-    def _value_lstm_weights_init(m):
+    def _value_weights_init(m):
         nn.init.orthogonal_(m.weight, gain=1.0)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0.0) 
 
     @staticmethod
     def _policy_weights_init(m):
-        nn.init.orthogonal_(m.weight, gain=0.01)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0) 
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0) 
+
+    def _get_states(self, x, lstm_state, done):
+        input_activation = self.cnn_fc(self.cnn_base(x).view(-1, 256)) # input_activation.shape = (128, 1, 1)
+        # LSTM logic
+        batch_size = lstm_state[0].shape[1]
+        input_activation = input_activation.reshape((-1, batch_size, self.lstm.input_size)) # (1, 1, 128)
+        new_hidden = []
+        for i in input_activation:
+            # nn.LSTM( input, (h_t-1, c_t-1) ) -> output, (h_t, c_t), where h = hidden and c = context/cell states
+            i, lstm_state = self.lstm( # i.shape [1, 128]
+                i.unsqueeze(0), # i.unsqueeze(0).shape [1, 1, 128]
+                (
+                    (1.0 - done) * lstm_state[0],
+                    (1.0 - done) * lstm_state[1],
+                ),
+            )
+            new_hidden += [i]
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, lstm_state
+    
+    def forward(self, x, lstm_state, done):
+        hidden, lstm_state = self._get_states(x, lstm_state, done)
+        v = self.v(hidden)
+        alpha = self.alpha_head(hidden) + 1
+        beta = self.beta_head(hidden) + 1
+        return (alpha, beta, lstm_state), v
 
 class Agent():
     """
@@ -160,45 +190,17 @@ class Agent():
         self.buffer = np.empty(self.buffer_capacity, dtype=transition)
         self.counter = 0
         self.optimizer = optim.Adam(self.net.parameters(), lr=1e-4) # starting lr was 1e-3
-
-    def zero_out_states(self, x, lstm_state, done):
-        cnn_hidden_activations = self.net.cnn_base(x)
-        # LSTM logic
-        batch_size = lstm_state[0].shape[1]
-        new_hidden = []
-        for h, d in zip(cnn_hidden_activations, done):
-            h, lstm_state = self.net.lstm(
-                h.unsqueeze(0),
-                (
-                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
-                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
-                ),
-            )
-            new_hidden += [h]
-        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
-        return new_hidden, lstm_state
     
-    def forward(self, x):
-        x = self.cnn_base(x)
-        x = x.view(-1, 256)
-        v = self.v(x)
-        x = self.fc(x)
-        alpha = self.alpha_head(x) + 1
-        beta = self.beta_head(x) + 1
-
-        return (alpha, beta), v
-    
-    def select_action(self, state):
-        state = torch.from_numpy(state).double().to(device).unsqueeze(0)
+    def select_action(self, state, lstm_state, done):
+        state = torch.from_numpy(state).double().to(device).unsqueeze(0) # converts shape to (1, 96, 96)
         with torch.no_grad():
-            alpha, beta = self.net(state)[0]
+            alpha, beta, lstm_state = self.net(state, lstm_state, done)[0]
         dist = Beta(alpha, beta)
         action = dist.sample()
         a_logp = dist.log_prob(action).sum(dim=1)
-
         action = action.squeeze().cpu().numpy()
         a_logp = a_logp.item()
-        return action, a_logp
+        return action, a_logp, lstm_state
 
     def save_param(self, episode_num, score, running_score):
         checkpoint = {
@@ -208,11 +210,11 @@ class Agent():
                 'running_score': float(running_score),
                 'seed': float(args.seed)
             }
-        torch.save(checkpoint, f'param/params_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_img_stack_{args.img_stack}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
+        torch.save(checkpoint, f'param/params_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
 
     def load_param(self, path=None):
         if path is None:
-            path = f'param/params_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_img_stack_{args.img_stack}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
+            path = f'param/params_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
         checkpoint = torch.load(path, map_location=device)
         self.net.load_state_dict(checkpoint['model_state_dict'])
         print(f'Loaded episode_num {checkpoint['episode_num']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
@@ -291,18 +293,16 @@ if __name__ == "__main__":
 
     training_records = []
     
-    state = env.reset()
-    next_lstm_state = (
-        torch.zeros(agent.net.lstm.num_layers, agent.net.lstm.hidden_size).to(device),
-        torch.zeros(agent.net.lstm.num_layers, agent.net.lstm.hidden_size).to(device),
-    )  # hidden and context states
-
     for i_ep in range(episode_num, 100000):
         score = 0
-        state = env.reset()
-
+        next_lstm_state = (
+            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+        )  # hidden and context states
+        state = env.reset() # state.shape (96, 96)
+        done = 0
         for t in range(args.max_episode_steps): # max number of steps in an episode
-            action, a_logp = agent.select_action(state)
+            action, a_logp, next_lstm_state = agent.select_action(state, next_lstm_state, done)
             state_, reward, done, die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
             if args.render:
                 env.render()
