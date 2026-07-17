@@ -210,11 +210,11 @@ class Agent():
                 'running_score': float(running_score),
                 'seed': float(args.seed)
             }
-        torch.save(checkpoint, f'checkpoints/gym_cont_car_racing_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
+        torch.save(checkpoint, f'checkpoints/car_racing_lstm_{args.num_lstm_layers}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
 
     def load_param(self, path=None):
         if path is None:
-            path = f'checkpoints/gym_cont_car_racing_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
+            path = f'checkpoints/car_racing_lstm_{args.num_lstm_layers}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
         checkpoint = torch.load(path, map_location=device)
         self.net.load_state_dict(checkpoint['model_state_dict'])
         print(f'Loaded episode_num {checkpoint['episode_num']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
@@ -298,9 +298,9 @@ class Agent():
                     if approx_kl > args.target_kl:
                         print(approx_kl)
             writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
-            writer.add_scalar("Loss/action", np.mean(action_loss), self.training_step)
-            writer.add_scalar("Loss/value", np.mean(value_loss), self.training_step)
-            writer.add_scalar("KL/approx_kl", np.mean(approx_kl), self.training_step)
+            writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
+            writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
+            writer.add_scalar("KL/approx_kl", np.mean(mean_approx_kl), self.training_step)
 
 
 if __name__ == "__main__":
