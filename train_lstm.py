@@ -145,17 +145,6 @@ class Net(nn.Module):
         if m.bias is not None:
             nn.init.constant_(m.bias, 0.0) 
 
-    def forward(self, x):
-        x = self.cnn_base(x)
-        x = x.view(-1, 256)
-        v = self.v(x)
-        x = self.fc(x)
-        alpha = self.alpha_head(x) + 1
-        beta = self.beta_head(x) + 1
-
-        return (alpha, beta), v
-
-
 class Agent():
     """
     Agent for training
@@ -170,9 +159,35 @@ class Agent():
         self.net = Net().double().to(device)
         self.buffer = np.empty(self.buffer_capacity, dtype=transition)
         self.counter = 0
-
         self.optimizer = optim.Adam(self.net.parameters(), lr=1e-4) # starting lr was 1e-3
 
+    def zero_out_states(self, x, lstm_state, done):
+        cnn_hidden_activations = self.net.cnn_base(x)
+        # LSTM logic
+        batch_size = lstm_state[0].shape[1]
+        new_hidden = []
+        for h, d in zip(cnn_hidden_activations, done):
+            h, lstm_state = self.net.lstm(
+                h.unsqueeze(0),
+                (
+                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
+                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
+                ),
+            )
+            new_hidden += [h]
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, lstm_state
+    
+    def forward(self, x):
+        x = self.cnn_base(x)
+        x = x.view(-1, 256)
+        v = self.v(x)
+        x = self.fc(x)
+        alpha = self.alpha_head(x) + 1
+        beta = self.beta_head(x) + 1
+
+        return (alpha, beta), v
+    
     def select_action(self, state):
         state = torch.from_numpy(state).double().to(device).unsqueeze(0)
         with torch.no_grad():
@@ -277,6 +292,11 @@ if __name__ == "__main__":
     training_records = []
     
     state = env.reset()
+    next_lstm_state = (
+        torch.zeros(agent.net.lstm.num_layers, agent.net.lstm.hidden_size).to(device),
+        torch.zeros(agent.net.lstm.num_layers, agent.net.lstm.hidden_size).to(device),
+    )  # hidden and context states
+
     for i_ep in range(episode_num, 100000):
         score = 0
         state = env.reset()
