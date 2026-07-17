@@ -325,8 +325,8 @@ if __name__ == "__main__":
     for i_ep in range(episode_num, args.max_episodes):
         score = 0
         zero_state = (
-            torch.zeros(1, agent.net.lstm.num_layers, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
-            torch.zeros(1, agent.net.lstm.num_layers, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
         )  # hidden and context states
         next_lstm_state = (zero_state[0].clone(), zero_state[1].clone())
         state = env.reset() # state.shape (channels since keep_dim=True --> 96, 96, 1)
