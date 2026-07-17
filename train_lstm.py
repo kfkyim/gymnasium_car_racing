@@ -30,11 +30,12 @@ args = parser.parse_args()
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 torch.manual_seed(args.seed)
+np.random.seed(args.seed)
 if use_cuda:
     torch.cuda.manual_seed(args.seed)
     # These would absolutely make the training deterministic, but they would also slow down the training. Useful for debugging/tuning but not for actual training.
-    # torch.backends.cudnn.deterministic = True   # force cuDNN to pick a deterministic algorithm
-    # torch.backends.cudnn.benchmark = False       # prevents the auto-tuner from overriding that choice and selecting a nondeterministic algorithm that would be faster
+    torch.backends.cudnn.deterministic = True   # force cuDNN to pick a deterministic algorithm
+    torch.backends.cudnn.benchmark = False       # prevents the auto-tuner from overriding that choice and selecting a nondeterministic algorithm that would be faster
     
 transition = np.dtype([('s', np.float64, (1, 96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
                        ('r', np.float64), ('s_', np.float64, (1, 96, 96)), ('die', np.int32), ('done', np.int32)])
@@ -299,11 +300,11 @@ if __name__ == "__main__":
     
     for i_ep in range(episode_num, 100000):
         score = 0
-        next_lstm_state = (
+        zero_state = (
             torch.zeros(1, agent.net.lstm.num_layers, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
             torch.zeros(1, agent.net.lstm.num_layers, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
         )  # hidden and context states
-        initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
+        next_lstm_state = (zero_state[0].clone(), zero_state[1].clone())
         state = env.reset() # state.shape (channels since keep_dim=True --> 96, 96, 1)
         state = state.reshape(1, 96, 96)
         next_done = torch.zeros(1).to(device)
@@ -315,7 +316,7 @@ if __name__ == "__main__":
                 env.render()
             if agent.store((state, action, a_logp, reward, state_, die, done)):
                 print('updating')
-                agent.update(initial_lstm_state)
+                agent.update(zero_state)
             score += reward
             state = state_
             next_done = torch.tensor([done], dtype=torch.int32).to(device)
@@ -338,3 +339,5 @@ if __name__ == "__main__":
         if running_score > env.reward_threshold:
             print("Solved! Running reward is now {} and the last episode runs to {}!".format(running_score, score))
             break
+
+# TODO: set up Aim or others to help track experiment + parameters you used. Then you can compare how much improvements changes have yielded, e.g. from normalizing rewards.
