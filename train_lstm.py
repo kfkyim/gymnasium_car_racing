@@ -1,5 +1,6 @@
 import argparse
-
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 import numpy as np
 
 import gymnasium as gym
@@ -13,19 +14,26 @@ from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from utils import DrawLine
 
 parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacing-v0')
-parser.add_argument('--max-episode-steps', type=int, default=1000, metavar='N', help='maximum number of steps in an episode (default: 1000)')
+parser.add_argument('--max-episodes', type=int, default=3000, metavar='N', help='maximum number of episodes (default: 3000)')
+parser.add_argument('--max-episode-steps', type=int, default=1500, metavar='N', help='maximum number of steps in an episode (default: 1500)')
+parser.add_argument('--buffer-capacity', type=int, default=2096, metavar='N', help='buffer capacity (default: 2096)')
 parser.add_argument('--unroll-steps', type=int, default=128, metavar='N', help='number of steps per rollout (default: 128)')
 parser.add_argument('--params-path', type=str, default=None, help='path to the saved model parameters')
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='discount factor (default: 0.99)')
 parser.add_argument('--lambda_', type=float, default=0, metavar='G', help='GAE lambda factor (default: 0)')
 parser.add_argument('--lr', type=float, default=1e-4, metavar='G', help='learning rate of agent (default: 1e-4)')
-parser.add_argument('--action-repeat', type=int, default=4, metavar='N', help='repeat action in N frames (default: 8)')
+parser.add_argument('--num-lstm-layers', type=int, default=1, metavar='N', help='number of LSTM layers (default: 1)')
+parser.add_argument('--action-repeat', type=int, default=4, metavar='N', help='repeat action in N frames (default: 4)')
 parser.add_argument('--seed', type=int, default=125, metavar='N', help='random seed (default: 125)')
 parser.add_argument('--render', action='store_true', default=False, help='render the environment')
 parser.add_argument('--vis', action='store_true', help='use visdom')
 parser.add_argument('--log-interval', type=int, default=5, metavar='N', help='interval between training status logs (default: 5)')
 parser.add_argument('--load-weights', action='store_true', help='load pre-trained weights')
+parser.add_argument("--target-kl", type=float, default=0.02, help="the target KL divergence threshold")
 args = parser.parse_args()
+
+run_name = f"lstm_car_racing_continuous_{datetime.now().strftime('%b%d_%H%M')}"
+writer = SummaryWriter(log_dir=f"runs/{run_name}")
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -115,7 +123,7 @@ class Net(nn.Module):
         )  # output shape (256, 1, 1)
         # input shape expected: (1, 256) --> use .view(-1, 256) for this in _get_states().
         self.cnn_fc = nn.Sequential(nn.Linear(256, 128), nn.ReLU()) # output shape: (1, 128)
-        self.lstm = nn.LSTM(128, 64)
+        self.lstm = nn.LSTM(128, 64, args.num_lstm_layers)
         self.v = nn.Linear(64, 1)
         self.alpha_head = nn.Sequential(nn.Linear(64, 3), nn.Softplus())
         self.beta_head = nn.Sequential(nn.Linear(64, 3), nn.Softplus())
@@ -187,11 +195,10 @@ class Agent():
     max_grad_norm = 0.5
     clip_param = 0.1  # epsilon in clipped loss
     ppo_epoch = 5
-    buffer_capacity = 2096
     def __init__(self):
         self.training_step = 0
         self.net = Net().double().to(device)
-        self.buffer = np.empty(self.buffer_capacity, dtype=transition)
+        self.buffer = np.empty(args.buffer_capacity, dtype=transition)
         self.counter = 0
         self.optimizer = optim.Adam(self.net.parameters(), lr=1e-4) # starting lr was 1e-3
 
@@ -203,11 +210,11 @@ class Agent():
                 'running_score': float(running_score),
                 'seed': float(args.seed)
             }
-        torch.save(checkpoint, f'lstm_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
+        torch.save(checkpoint, f'checkpoints/gym_cont_car_racing_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
 
     def load_param(self, path=None):
         if path is None:
-            path = f'param/params_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
+            path = f'checkpoints/gym_cont_car_racing_max_ep_steps_{args.max_episode_steps}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
         checkpoint = torch.load(path, map_location=device)
         self.net.load_state_dict(checkpoint['model_state_dict'])
         print(f'Loaded episode_num {checkpoint['episode_num']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
@@ -216,7 +223,7 @@ class Agent():
     def store(self, transition):
         self.buffer[self.counter] = transition
         self.counter += 1
-        if self.counter == self.buffer_capacity:
+        if self.counter == args.buffer_capacity:
             self.counter = 0
             return True
         else:
@@ -258,13 +265,19 @@ class Agent():
             gae = delta[t] + args.gamma * args.lambda_ * gae * (1 - die[t]) * (1 - done[t]) # if a state is die or done, then reset gae = delta[t] + 0
             adv[t] = gae
 
+        mean_total_loss, mean_action_loss, mean_value_loss, mean_approx_kl = [], [], [], []
         for _ in range(self.ppo_epoch):
-            for index in BatchSampler(range(self.buffer_capacity), args.unroll_steps, False):
+            for index in BatchSampler(range(args.buffer_capacity), args.unroll_steps, False):
 
                 alpha, beta, _ = self.net(s[index], lstm_state, terminal[index])[0]
                 dist = Beta(alpha, beta)
                 a_logp = dist.log_prob(a[index]).sum(dim=1, keepdim=True)
-                ratio = torch.exp(a_logp - old_a_logp[index])
+                log_ratio = a_logp - old_a_logp[index]
+                ratio = torch.exp(log_ratio)
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-log_ratio).mean()
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
                 if self.training_step == 0: assert all(ratio == 1)
                 surr1 = ratio * adv[index]
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv[index]
@@ -277,6 +290,17 @@ class Agent():
                 # nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.training_step += 1
+                mean_total_loss.append(loss.item())
+                mean_action_loss.append(action_loss.item())
+                mean_value_loss.append(value_loss.item())
+                mean_approx_kl.append(approx_kl.item())
+                if args.target_kl is not None:
+                    if approx_kl > args.target_kl:
+                        print(approx_kl)
+            writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
+            writer.add_scalar("Loss/action", np.mean(action_loss), self.training_step)
+            writer.add_scalar("Loss/value", np.mean(value_loss), self.training_step)
+            writer.add_scalar("KL/approx_kl", np.mean(approx_kl), self.training_step)
 
 
 if __name__ == "__main__":
@@ -298,7 +322,7 @@ if __name__ == "__main__":
 
     training_records = []
     
-    for i_ep in range(episode_num, 100000):
+    for i_ep in range(episode_num, args.max_episodes):
         score = 0
         zero_state = (
             torch.zeros(1, agent.net.lstm.num_layers, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
@@ -335,9 +359,12 @@ if __name__ == "__main__":
             if args.vis:
                 draw_reward(xdata=i_ep, ydata=running_score)
             print('Ep {}\tLast score: {:.2f}\tMoving average score: {:.2f}'.format(i_ep, score, running_score))
+            writer.add_scalar("Score/raw", score, i_ep)
+            writer.add_scalar("Score/running_avg", running_score, i_ep)
 
         if running_score > env.reward_threshold:
             print("Solved! Running reward is now {} and the last episode runs to {}!".format(running_score, score))
             break
 
-# TODO: set up Aim or others to help track experiment + parameters you used. Then you can compare how much improvements changes have yielded, e.g. from normalizing rewards.
+    writer.add_hparams(vars(args), {"best_score": best_score, "best_running": best_running_score})
+    writer.close()
