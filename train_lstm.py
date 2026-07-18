@@ -46,8 +46,8 @@ if use_cuda:
     torch.backends.cudnn.deterministic = True   # force cuDNN to pick a deterministic algorithm
     torch.backends.cudnn.benchmark = False       # prevents the auto-tuner from overriding that choice and selecting a nondeterministic algorithm that would be faster
     
-transition = np.dtype([('s', np.float64, (1, 96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
-                       ('r', np.float64), ('s_', np.float64, (1, 96, 96)), ('die', np.int32), ('done', np.int32)])
+transition = np.dtype([('o', np.float64, (1, 96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
+                       ('r', np.float64), ('next_o', np.float64, (1, 96, 96)), ('v', np.float64), ('next_die', np.int32), ('next_done', np.int32)])
 
 class Env():
     """
@@ -198,7 +198,7 @@ class Agent():
     def __init__(self):
         self.training_step = 0
         self.net = Net().double().to(device)
-        self.buffer = np.empty(args.buffer_capacity, dtype=transition)
+        self.buffer = np.empty(args.unroll_steps, dtype=transition)
         self.counter = 0
         self.optimizer = optim.Adam(self.net.parameters(), lr=1e-4) # starting lr was 1e-3
 
@@ -223,84 +223,90 @@ class Agent():
     def store(self, transition):
         self.buffer[self.counter] = transition
         self.counter += 1
-        if self.counter == args.buffer_capacity:
+        if self.counter == args.unroll_steps:
             self.counter = 0
             return True
         else:
             return False
     
-    def select_action(self, state, lstm_state, done):
+    def select_action_and_value(self, state, lstm_state, next_done):
         state = torch.from_numpy(state).double().to(device).unsqueeze(0) # converts shape to (seq_len=1, channels=1, 96, 96)
         with torch.no_grad():
-            alpha, beta, lstm_state = self.net(state, lstm_state, done)[0]
+            (alpha, beta, lstm_state), value = self.net(state, lstm_state, next_done)
         dist = Beta(alpha, beta)
         action = dist.sample()
         a_logp = dist.log_prob(action).sum(dim=1)
         action = action.squeeze().cpu().numpy()
         a_logp = a_logp.item()
-        return action, a_logp, lstm_state
+        return action, a_logp, lstm_state, value
     
-    def update(self, lstm_state):
-        s = torch.tensor(self.buffer['s'], dtype=torch.double).to(device)
+    def update(self, lstm_state, last_lstm_state_for_bootstrap):
+        o = torch.tensor(self.buffer['o'], dtype=torch.double).to(device)
         a = torch.tensor(self.buffer['a'], dtype=torch.double).to(device)
         r = torch.tensor(self.buffer['r'], dtype=torch.double).to(device).view(-1, 1)
-        s_ = torch.tensor(self.buffer['s_'], dtype=torch.double).to(device)
-        die = torch.tensor(self.buffer['die'], dtype=torch.int32).to(device).view(-1, 1)
-        done = torch.tensor(self.buffer['done'], dtype=torch.int32).to(device).view(-1, 1)
-        terminal = 1 - (1 - done) * (1 - die)
+        next_o = torch.tensor(self.buffer['next_o'], dtype=torch.double).to(device)
+        v = torch.tensor(self.buffer['v'], dtype=torch.double).to(device)
+        v = v.view(-1, 1)
+        next_die = torch.tensor(self.buffer['next_die'], dtype=torch.int32).to(device).view(-1, 1)
+        next_done = torch.tensor(self.buffer['next_done'], dtype=torch.int32).to(device).view(-1, 1)
+        next_terminal = 1 - (1 - next_done) * (1 - next_die)
 
         old_a_logp = torch.tensor(self.buffer['a_logp'], dtype=torch.double).to(device).view(-1, 1)
         adv = torch.zeros(r.shape, dtype=torch.double).to(device)
         T=len(r)
-        # TODO: if you store v and v_ (with bootstrap for final state + 1), then you don't need to recalculate here.
         with torch.no_grad():
-            v = self.net(s, lstm_state, terminal)[1] # s.shape -> (seq_len)
-            v_next = self.net(s_, lstm_state, terminal)[1]
-            not_die = 1 # (1 - die) normally, we would penalize the value of the next state if the current state is die, but the original author of this fork didn't penalize and it worked well. So we will keep it as 1.
-            target_v = r + args.gamma * v_next * not_die
+            v_last = self.net(next_o[-1].unsqueeze(0), last_lstm_state_for_bootstrap, next_terminal[-1])[1] # bootstrap
+            v_next = torch.cat([v, v_last], 0)[1:]
+            target_v = r + args.gamma * v_next * (1 - next_die) # if die (not trunc), penalize next state with just r.
             delta = target_v - v
         
         gae = 0
         for t in reversed(range(T)):
-            gae = delta[t] + args.gamma * args.lambda_ * gae * (1 - die[t]) * (1 - done[t]) # if a state is die or done, then reset gae = delta[t] + 0
+            gae = delta[t] + args.gamma * args.lambda_ * gae * (1 - next_die[t]) * (1 - next_done[t]) # if a state is die or done, then reset gae = delta[t] + 0
             adv[t] = gae
 
         mean_total_loss, mean_action_loss, mean_value_loss, mean_approx_kl = [], [], [], []
-        for _ in range(args.ppo_epochs):
-            for index in BatchSampler(range(args.buffer_capacity), args.unroll_steps, False):
 
-                alpha, beta, _ = self.net(s[index], lstm_state, terminal[index])[0]
-                dist = Beta(alpha, beta)
-                a_logp = dist.log_prob(a[index]).sum(dim=1, keepdim=True)
-                log_ratio = a_logp - old_a_logp[index]
-                ratio = torch.exp(log_ratio)
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-log_ratio).mean()
-                    approx_kl = ((ratio - 1) - log_ratio).mean()
-                if self.training_step == 0: assert all(torch.round(ratio) == 1)
-                surr1 = ratio * adv[index]
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv[index]
-                action_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.smooth_l1_loss(self.net(s[index], lstm_state, terminal[index])[1], target_v[index])
-                loss = action_loss + 2. * value_loss
+        # if used 's' and original 'terminal', in get_states(), it will zero-out LSTM hidden values
+        # when predicting for 's' which still belongs to current episode. we only want to zero-out when starting next episode.
+        terminal = torch.zeros_like(next_terminal)
+        terminal[1:] = next_terminal[:-1]
+        terminal[0] = 0 
+        
+        for i in range(args.ppo_epochs):
+            index = range(args.unroll_steps)
+            (alpha, beta, _), new_value = self.net(o[index], lstm_state, terminal[index])
+            dist = Beta(alpha, beta)
+            a_logp = dist.log_prob(a[index]).sum(dim=1, keepdim=True)
+            log_ratio = a_logp - old_a_logp[index]
+            ratio = torch.exp(log_ratio)
+            with torch.no_grad():
+                # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                old_approx_kl = (-log_ratio).mean()
+                approx_kl = ((ratio - 1) - log_ratio).mean()
+            if i == 0: assert all(torch.round(ratio) == 1)
+            surr1 = ratio * adv[index]
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv[index]
+            action_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.smooth_l1_loss(new_value, target_v[index])
+            loss = action_loss + 2. * value_loss
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                # nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                self.training_step += 1
-                mean_total_loss.append(loss.item())
-                mean_action_loss.append(action_loss.item())
-                mean_value_loss.append(value_loss.item())
-                mean_approx_kl.append(approx_kl.item())
-                if args.target_kl is not None:
-                    if approx_kl > args.target_kl:
-                        print(approx_kl)
-            writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
-            writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
-            writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
-            writer.add_scalar("KL/approx_kl", np.mean(mean_approx_kl), self.training_step)
+            self.optimizer.zero_grad()
+            loss.backward()
+            # nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            self.training_step += 1
+            mean_total_loss.append(loss.item())
+            mean_action_loss.append(action_loss.item())
+            mean_value_loss.append(value_loss.item())
+            mean_approx_kl.append(approx_kl.item())
+            if args.target_kl is not None:
+                if approx_kl > args.target_kl:
+                    print(approx_kl)
+        writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
+        writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
+        writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
+        writer.add_scalar("KL/approx_kl", np.mean(mean_approx_kl), self.training_step)
 
 
 if __name__ == "__main__":
@@ -321,30 +327,32 @@ if __name__ == "__main__":
         draw_reward = DrawLine(env="car", title="PPO", xlabel="Episode", ylabel="Moving averaged episode reward")
 
     training_records = []
-    
-    for i_ep in range(episode_num, args.max_episodes):
-        score = 0
-        zero_state = (
+    next_lstm_state = (
             torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
             torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
         )  # hidden and context states
-        next_lstm_state = (zero_state[0].clone(), zero_state[1].clone())
-        state = env.reset() # state.shape (channels since keep_dim=True --> 96, 96, 1)
-        state = state.reshape(1, 96, 96)
+    
+    for i_ep in range(episode_num, args.max_episodes):
+        score = 0
+        initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
+        next_obs = env.reset() # state.shape (channels since keep_dim=True --> 96, 96, 1)
+        next_obs = next_obs.reshape(1, 96, 96)
         next_done = torch.zeros(1).to(device)
-        for t in range(args.max_episode_steps): # max number of steps in an episode
-            action, a_logp, next_lstm_state = agent.select_action(state, next_lstm_state, next_done)
-            state_, reward, done, die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
-            state_ = state_.reshape(1, 96, 96)
+        for t in range(args.max_episode_steps):
+            # next_done and next_die tells you a new episode is starting after this timestep.
+            action, a_logp, next_lstm_state, value = agent.select_action_and_value(next_obs, next_lstm_state, next_done)
+            next_next_obs, reward, next_done, next_die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
+            next_next_obs = next_next_obs.reshape(1, 96, 96)
             if args.render:
                 env.render()
-            if agent.store((state, action, a_logp, reward, state_, die, done)):
+            if agent.store((next_obs, action, a_logp, reward, next_next_obs, value, next_die, next_done)):
                 print('updating')
-                agent.update(zero_state)
+                agent.update(initial_lstm_state, next_lstm_state)
+                initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
             score += reward
-            state = state_
-            next_done = torch.tensor([done], dtype=torch.int32).to(device)
-            if done or die:
+            next_obs = next_next_obs
+            next_done = torch.tensor([next_done], dtype=torch.int32).to(device)
+            if next_done or next_die:
                 break
         running_score = running_score * 0.99 + score * 0.01
         if score > best_score:
