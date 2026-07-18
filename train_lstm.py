@@ -346,7 +346,6 @@ if __name__ == "__main__":
             if args.render:
                 env.render()
             if agent.store((next_obs, action, a_logp, reward, next_next_obs, value, next_die, next_done)):
-                print('updating')
                 agent.update(initial_lstm_state, next_lstm_state)
                 initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
             score += reward
