@@ -17,7 +17,6 @@ parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacin
 parser.add_argument('--max-episodes', type=int, default=2000, metavar='N', help='maximum number of episodes (default: 3000)')
 parser.add_argument('--max-episode-steps', type=int, default=1500, metavar='N', help='maximum number of steps in an episode (default: 1500)')
 parser.add_argument('--ppo-epochs', type=int, default=5, metavar='N', help='(default: 5)')
-parser.add_argument('--buffer-capacity', type=int, default=2096, metavar='N', help='buffer capacity (default: 2096)')
 parser.add_argument('--unroll-steps', type=int, default=128, metavar='N', help='number of steps per rollout (default: 128)')
 parser.add_argument('--params-path', type=str, default=None, help='path to the saved model parameters')
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='discount factor (default: 0.99)')
