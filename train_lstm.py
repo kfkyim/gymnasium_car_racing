@@ -14,8 +14,9 @@ from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from utils import DrawLine
 
 parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacing-v0')
-parser.add_argument('--max-episodes', type=int, default=3000, metavar='N', help='maximum number of episodes (default: 3000)')
+parser.add_argument('--max-episodes', type=int, default=2000, metavar='N', help='maximum number of episodes (default: 3000)')
 parser.add_argument('--max-episode-steps', type=int, default=1500, metavar='N', help='maximum number of steps in an episode (default: 1500)')
+parser.add_argument('--ppo-epochs', type=int, default=5, metavar='N', help='(default: 5)')
 parser.add_argument('--buffer-capacity', type=int, default=2096, metavar='N', help='buffer capacity (default: 2096)')
 parser.add_argument('--unroll-steps', type=int, default=128, metavar='N', help='number of steps per rollout (default: 128)')
 parser.add_argument('--params-path', type=str, default=None, help='path to the saved model parameters')
@@ -121,12 +122,12 @@ class Net(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, stride=1),  # (128, 3, 3)
             nn.ReLU(),  # activation
         )  # output shape (256, 1, 1)
-        # input shape expected: (1, 256) --> use .view(-1, 256) for this in _get_states().
         self.cnn_fc = nn.Sequential(nn.Linear(256, 128), nn.ReLU()) # output shape: (1, 128)
         self.lstm = nn.LSTM(128, 64, args.num_lstm_layers)
         self.v = nn.Linear(64, 1)
         self.alpha_head = nn.Sequential(nn.Linear(64, 3), nn.Softplus())
         self.beta_head = nn.Sequential(nn.Linear(64, 3), nn.Softplus())
+
         self.cnn_base.apply(self._cnn_weights_init)
         self.cnn_fc.apply(self._cnn_weights_init)
         
@@ -194,7 +195,6 @@ class Agent():
     """
     max_grad_norm = 0.5
     clip_param = 0.1  # epsilon in clipped loss
-    ppo_epoch = 5
     def __init__(self):
         self.training_step = 0
         self.net = Net().double().to(device)
@@ -252,7 +252,7 @@ class Agent():
         old_a_logp = torch.tensor(self.buffer['a_logp'], dtype=torch.double).to(device).view(-1, 1)
         adv = torch.zeros(r.shape, dtype=torch.double).to(device)
         T=len(r)
-        
+        # TODO: if you store v and v_ (with bootstrap for final state + 1), then you don't need to recalculate here.
         with torch.no_grad():
             v = self.net(s, lstm_state, terminal)[1] # s.shape -> (seq_len)
             v_next = self.net(s_, lstm_state, terminal)[1]
@@ -266,7 +266,7 @@ class Agent():
             adv[t] = gae
 
         mean_total_loss, mean_action_loss, mean_value_loss, mean_approx_kl = [], [], [], []
-        for _ in range(self.ppo_epoch):
+        for _ in range(args.ppo_epochs):
             for index in BatchSampler(range(args.buffer_capacity), args.unroll_steps, False):
 
                 alpha, beta, _ = self.net(s[index], lstm_state, terminal[index])[0]
@@ -278,7 +278,7 @@ class Agent():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-log_ratio).mean()
                     approx_kl = ((ratio - 1) - log_ratio).mean()
-                if self.training_step == 0: assert all(ratio == 1)
+                if self.training_step == 0: assert all(torch.round(ratio) == 1)
                 surr1 = ratio * adv[index]
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv[index]
                 action_loss = -torch.min(surr1, surr2).mean()
