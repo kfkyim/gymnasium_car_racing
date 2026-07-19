@@ -15,7 +15,7 @@ from utils import DrawLine
 
 parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacing-v0')
 parser.add_argument('--model-name', type=str, help='model name used to save checkpoint.')
-parser.add_argument('--max-training-steps', type=int, default=4000, metavar='N', help='maximum number of training steps. incremented by 1 * ppo_epochs once buffer full (default: 4000)')
+parser.add_argument('--max-training-steps', type=int, default=10000, metavar='N', help='maximum number of training steps. incremented by 1 * ppo_epochs once buffer full (default: 10000)')
 parser.add_argument('--max-episode-steps', type=int, default=1500, metavar='N', help='maximum number of steps in an episode (default: 1500)')
 parser.add_argument('--ppo-epochs', type=int, default=5, metavar='N', help='(default: 5)')
 parser.add_argument('--unroll-steps', type=int, default=128, metavar='N', help='number of steps per rollout (default: 128)')
@@ -310,11 +310,13 @@ class Agent():
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     print(approx_kl)
+        with torch.no_grad():
+            (_, _, latest_lstm_state), _ = self.net(o[index], lstm_state, terminal[index])
         writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
         writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
         writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
         writer.add_scalar("KL/approx_kl", np.mean(mean_approx_kl), self.training_step)
-
+        return latest_lstm_state
 
 if __name__ == "__main__":
     agent = Agent()
@@ -343,6 +345,8 @@ if __name__ == "__main__":
         if args.anneal_lr:
             frac = 1.0 - (agent.training_step - 1.0) / args.max_training_steps
             lrnow = frac * args.lr
+            if lrnow <= 0.1 * args.lr:
+                lrnow = 0.1 * args.lr
             agent.optimizer.param_groups[0]["lr"] = lrnow
         score = 0
         initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
@@ -357,13 +361,17 @@ if __name__ == "__main__":
             if args.render:
                 env.render()
             if agent.store((next_obs, action, a_logp, reward, next_next_obs, value, next_die, next_done)):
-                agent.update(initial_lstm_state, next_lstm_state)
+                next_lstm_state = agent.update(initial_lstm_state, next_lstm_state)
                 initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
             score += reward
             next_obs = next_next_obs
             next_done = torch.tensor([next_done], dtype=torch.int32).to(device)
             if next_done or next_die:
                 episode_num += 1
+                next_lstm_state = (
+                        torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+                        torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+                    )  # hidden and context states
                 break
         running_score = running_score * 0.99 + score * 0.01
         if score > best_score:
@@ -377,7 +385,7 @@ if __name__ == "__main__":
         if episode_num % args.log_interval == 0:
             if args.vis:
                 draw_reward(xdata=agent.training_step, ydata=running_score)
-            print('Upd Step {}\tLast score: {:.2f}\tMoving average score: {:.2f}\tLearning rate: {:.6f}'.format(agent.training_step, score, running_score, agent.optimizer.param_groups[0]["lr"]))
+            print('Episode {}\tUpd Step {}\tLast score: {:.2f}\tMoving average score: {:.2f}\tLearning rate: {:.6f}'.format(episode_num,agent.training_step, score, running_score, agent.optimizer.param_groups[0]["lr"]))
             writer.add_scalar("Score/raw", score, agent.training_step)
             writer.add_scalar("Score/running_avg", running_score, agent.training_step)
 
