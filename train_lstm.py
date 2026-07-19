@@ -52,8 +52,8 @@ if use_cuda:
     torch.backends.cudnn.deterministic = True   # force cuDNN to pick a deterministic algorithm
     torch.backends.cudnn.benchmark = False       # prevents the auto-tuner from overriding that choice and selecting a nondeterministic algorithm that would be faster
     
-transition = np.dtype([('o', np.float64, (1, 96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
-                       ('r', np.float64), ('next_o', np.float64, (1, 96, 96)), ('v', np.float64), ('next_die', np.int32), ('next_done', np.int32)])
+transition = np.dtype([('o', np.float32, (1, 96, 96)), ('a', np.float32, (3,)), ('a_logp', np.float32),
+                       ('r', np.float32), ('next_o', np.float32, (1, 96, 96)), ('v', np.float32), ('next_die', np.int32), ('next_done', np.int32)])
 
 class Env():
     """
@@ -258,19 +258,20 @@ class Agent():
     def __init__(self):
         self.training_step = 0
         if args.model.lower() == 'net':
-            self.net = Net().double().to(device)
+            self.net = Net().float().to(device)
         elif args.model.lower() == 'net2':
-            self.net = Net2().double().to(device)
+            self.net = Net2().float().to(device)
         else:
             raise Exception('invalid model. choose net or net2.')
         self.buffer = np.empty(args.unroll_steps, dtype=transition)
         self.counter = 0
         self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr) # starting lr was 1e-3
 
-    def save_param(self, update_steps, score, running_score):
+    def save_param(self, update_steps, episode, score, running_score):
         checkpoint = {
                 'model_state_dict': self.net.state_dict(),
                 'update_steps': update_steps,
+                'episode': episode,
                 'best_score': float(score),
                 'running_score': float(running_score),
                 'seed': float(args.seed)
@@ -295,7 +296,7 @@ class Agent():
             return False
     
     def select_action_and_value(self, state, lstm_state, next_done):
-        state = torch.from_numpy(state).double().to(device).unsqueeze(0) # converts shape to (seq_len=1, channels=1, 96, 96)
+        state = torch.from_numpy(state).float().to(device).unsqueeze(0) # converts shape to (seq_len=1, channels=1, 96, 96)
         with torch.no_grad():
             (alpha, beta, lstm_state), value = self.net(state, lstm_state, next_done)
         dist = Beta(alpha, beta)
@@ -306,18 +307,18 @@ class Agent():
         return action, a_logp, lstm_state, value
     
     def update(self, lstm_state, last_lstm_state_for_bootstrap):
-        o = torch.tensor(self.buffer['o'], dtype=torch.double).to(device)
-        a = torch.tensor(self.buffer['a'], dtype=torch.double).to(device)
-        r = torch.tensor(self.buffer['r'], dtype=torch.double).to(device).view(-1, 1)
-        next_o = torch.tensor(self.buffer['next_o'], dtype=torch.double).to(device)
-        v = torch.tensor(self.buffer['v'], dtype=torch.double).to(device)
+        o = torch.tensor(self.buffer['o'], dtype=torch.float32).to(device)
+        a = torch.tensor(self.buffer['a'], dtype=torch.float32).to(device)
+        r = torch.tensor(self.buffer['r'], dtype=torch.float32).to(device).view(-1, 1)
+        next_o = torch.tensor(self.buffer['next_o'], dtype=torch.float32).to(device)
+        v = torch.tensor(self.buffer['v'], dtype=torch.float32).to(device)
         v = v.view(-1, 1)
         next_die = torch.tensor(self.buffer['next_die'], dtype=torch.int32).to(device).view(-1, 1)
         next_done = torch.tensor(self.buffer['next_done'], dtype=torch.int32).to(device).view(-1, 1)
         next_terminal = 1 - (1 - next_done) * (1 - next_die)
 
-        old_a_logp = torch.tensor(self.buffer['a_logp'], dtype=torch.double).to(device).view(-1, 1)
-        adv = torch.zeros(r.shape, dtype=torch.double).to(device)
+        old_a_logp = torch.tensor(self.buffer['a_logp'], dtype=torch.float32).to(device).view(-1, 1)
+        adv = torch.zeros(r.shape, dtype=torch.float32).to(device)
         T=len(r)
         with torch.no_grad():
             v_last = self.net(next_o[-1].unsqueeze(0), last_lstm_state_for_bootstrap, next_die[-1])[1] # bootstrap
@@ -373,7 +374,6 @@ class Agent():
         writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
         writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
         writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
-        writer.add_scalar("KL/approx_kl", np.mean(mean_approx_kl), self.training_step)
         return latest_lstm_state
 
 if __name__ == "__main__":
@@ -394,8 +394,8 @@ if __name__ == "__main__":
 
     training_records = []
     next_lstm_state = (
-            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
-            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.float32).to(device),
+            torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.float32).to(device),
         )  # hidden and context states
     episode_num = 0
     while agent.training_step < args.max_training_steps:
@@ -427,8 +427,8 @@ if __name__ == "__main__":
             if next_done or next_die:
                 episode_num += 1
                 next_lstm_state = (
-                        torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
-                        torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
+                        torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.float32).to(device),
+                        torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.float32).to(device),
                     )  # hidden and context states
                 break
         running_score = running_score * 0.99 + score * 0.01
@@ -437,7 +437,7 @@ if __name__ == "__main__":
 
         if running_score > best_running_score:
             best_running_score = running_score
-            agent.save_param(agent.training_step, score, best_running_score)
+            agent.save_param(agent.training_step, episode_num, score, best_running_score)
             print(f"New best running score: {best_running_score:.2f}, saved model parameters.\nBest score so far: {best_score:.2f}")
 
         if episode_num % args.log_interval == 0:
