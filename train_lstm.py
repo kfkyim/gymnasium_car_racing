@@ -4,7 +4,7 @@ from datetime import datetime
 import numpy as np
 
 import gymnasium as gym
-from gymnasium.wrappers import GrayscaleObservation, NormalizeObservation 
+from gymnasium.wrappers import GrayscaleObservation, NormalizeObservation, NormalizeReward
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +14,8 @@ from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from utils import DrawLine
 
 parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacing-v0')
-parser.add_argument('--max-episodes', type=int, default=2000, metavar='N', help='maximum number of episodes (default: 3000)')
+parser.add_argument('--model-name', type=str, help='model name used to save checkpoint.')
+parser.add_argument('--max-training-steps', type=int, default=4000, metavar='N', help='maximum number of training steps. incremented by 1 * ppo_epochs once buffer full (default: 4000)')
 parser.add_argument('--max-episode-steps', type=int, default=1500, metavar='N', help='maximum number of steps in an episode (default: 1500)')
 parser.add_argument('--ppo-epochs', type=int, default=5, metavar='N', help='(default: 5)')
 parser.add_argument('--unroll-steps', type=int, default=128, metavar='N', help='number of steps per rollout (default: 128)')
@@ -22,12 +23,14 @@ parser.add_argument('--params-path', type=str, default=None, help='path to the s
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='discount factor (default: 0.99)')
 parser.add_argument('--lambda_', type=float, default=0, metavar='G', help='GAE lambda factor (default: 0)')
 parser.add_argument('--vf_coef', type=float, default=0.5, metavar='G', help='"coefficient of the value function in loss function" (default: 0.5)')
-parser.add_argument('--lr', type=float, default=1e-4, metavar='G', help='learning rate of agent (default: 1e-4)')
+parser.add_argument('--lr', type=float, default=2.5e-4, metavar='G', help='learning rate of agent (default: 2.5e-4)')
+parser.add_argument('--anneal-lr', action='store_true', default=False, help='Toggle learning rate annealing for policy and value networks')
 parser.add_argument("--max-grad-norm", type=float, default=0.5, help="the maximum norm for the gradient clipping")
 parser.add_argument('--no-rewards-threshold', type=float, default=-0.1, metavar='G', help='threshold of average reward before terminating episode (default: -0.1)')
 parser.add_argument('--num-lstm-layers', type=int, default=1, metavar='N', help='number of LSTM layers (default: 1)')
 parser.add_argument('--action-repeat', type=int, default=4, metavar='N', help='repeat action in N frames (default: 4)')
 parser.add_argument('--seed', type=int, default=125, metavar='N', help='random seed (default: 125)')
+parser.add_argument('--scale-rewards', action='store_true', default=False, help='scale reward through NormalizeReward wrapper')
 parser.add_argument('--render', action='store_true', default=False, help='render the environment')
 parser.add_argument('--vis', action='store_true', help='use visdom')
 parser.add_argument('--log-interval', type=int, default=5, metavar='N', help='interval between training status logs (default: 5)')
@@ -35,7 +38,7 @@ parser.add_argument('--load-weights', action='store_true', help='load pre-traine
 parser.add_argument("--target-kl", type=float, default=0.02, help="the target KL divergence threshold")
 args = parser.parse_args()
 
-run_name = f"lstm_car_racing_continuous_{datetime.now().strftime('%b%d_%H%M')}"
+run_name = f"{args.model_name}_{datetime.now().strftime('%b%d_%H%M')}"
 writer = SummaryWriter(log_dir=f"runs/{run_name}")
 
 use_cuda = torch.cuda.is_available()
@@ -58,6 +61,8 @@ class Env():
 
     def __init__(self):
         self.env = NormalizeObservation(GrayscaleObservation(gym.make('CarRacing-v3', continuous=True, max_episode_steps=args.max_episode_steps), keep_dim=True))
+        if args.scale_rewards:
+            self.env = NormalizeReward(self.env)
         spec = gym.spec('CarRacing-v3')
         self.reward_threshold = spec.reward_threshold if spec.reward_threshold else float('inf')
         self.max_episode_steps = spec.max_episode_steps if spec.max_episode_steps else float('inf')
@@ -202,25 +207,25 @@ class Agent():
         self.net = Net().double().to(device)
         self.buffer = np.empty(args.unroll_steps, dtype=transition)
         self.counter = 0
-        self.optimizer = optim.Adam(self.net.parameters(), lr=1e-4) # starting lr was 1e-3
+        self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr) # starting lr was 1e-3
 
-    def save_param(self, episode_num, score, running_score):
+    def save_param(self, update_steps, score, running_score):
         checkpoint = {
                 'model_state_dict': self.net.state_dict(),
-                'episode_num': episode_num,
+                'update_steps': update_steps,
                 'best_score': float(score),
                 'running_score': float(running_score),
                 'seed': float(args.seed)
             }
-        torch.save(checkpoint, f'checkpoints/car_racing_lstm_{args.num_lstm_layers}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl')
+        torch.save(checkpoint, f'checkpoints/{args.model_name}.pkl')
 
     def load_param(self, path=None):
         if path is None:
-            path = f'checkpoints/car_racing_lstm_{args.num_lstm_layers}_action_repeat_{args.action_repeat}_lambda_{args.lambda_}_seed_{args.seed}.pkl'
+            raise Exception('No model path provided.')
         checkpoint = torch.load(path, map_location=device)
         self.net.load_state_dict(checkpoint['model_state_dict'])
-        print(f'Loaded episode_num {checkpoint['episode_num']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
-        return checkpoint['episode_num'], checkpoint['best_score'], checkpoint['running_score'], checkpoint['seed']
+        print(f'Loaded update_steps {checkpoint['update_steps']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
+        return checkpoint['update_steps'], checkpoint['best_score'], checkpoint['running_score'], checkpoint['seed']
 
     def store(self, transition):
         self.buffer[self.counter] = transition
@@ -266,7 +271,7 @@ class Agent():
         for t in reversed(range(T)):
             gae = delta[t] + args.gamma * args.lambda_ * gae * (1 - next_die[t]) * (1 - next_done[t]) # if a state is die or done, then reset gae = delta[t] + 0
             adv[t] = gae
-        # adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
         mean_total_loss, mean_action_loss, mean_value_loss, mean_approx_kl = [], [], [], []
 
         # if used 's' and original 'terminal', in get_states(), it will zero-out LSTM hidden values
@@ -314,12 +319,11 @@ class Agent():
 if __name__ == "__main__":
     agent = Agent()
     env = Env()
-    episode_num = 0
     running_score = 0
     best_score = float('-inf')
     best_running_score = float('-inf')
     if args.load_weights:
-        episode_num, best_score, loaded_running_score, loaded_seed = agent.load_param(args.params_path)
+        agent.training_step, best_score, loaded_running_score, loaded_seed = agent.load_param(args.params_path)
         if loaded_seed != args.seed: 
             print (f'Loaded seed {loaded_seed} is different from input seed {args.seed}. Restart running score.')
         else:
@@ -333,8 +337,13 @@ if __name__ == "__main__":
             torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
             torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.double).to(device),
         )  # hidden and context states
-    
-    for i_ep in range(episode_num, args.max_episodes):
+    episode_num = 0
+    while agent.training_step < args.max_training_steps:
+        # Annealing the rate if instructed to do so.
+        if args.anneal_lr:
+            frac = 1.0 - (agent.training_step - 1.0) / args.max_training_steps
+            lrnow = frac * args.lr
+            agent.optimizer.param_groups[0]["lr"] = lrnow
         score = 0
         initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
         next_obs = env.reset() # state.shape (channels since keep_dim=True --> 96, 96, 1)
@@ -354,6 +363,7 @@ if __name__ == "__main__":
             next_obs = next_next_obs
             next_done = torch.tensor([next_done], dtype=torch.int32).to(device)
             if next_done or next_die:
+                episode_num += 1
                 break
         running_score = running_score * 0.99 + score * 0.01
         if score > best_score:
@@ -361,15 +371,15 @@ if __name__ == "__main__":
 
         if running_score > best_running_score:
             best_running_score = running_score
-            agent.save_param(i_ep, score, best_running_score)
+            agent.save_param(agent.training_step, score, best_running_score)
             print(f"New best running score: {best_running_score:.2f}, saved model parameters.\nBest score so far: {best_score:.2f}")
 
-        if i_ep % args.log_interval == 0:
+        if episode_num % args.log_interval == 0:
             if args.vis:
-                draw_reward(xdata=i_ep, ydata=running_score)
-            print('Ep {}\tLast score: {:.2f}\tMoving average score: {:.2f}'.format(i_ep, score, running_score))
-            writer.add_scalar("Score/raw", score, i_ep)
-            writer.add_scalar("Score/running_avg", running_score, i_ep)
+                draw_reward(xdata=agent.training_step, ydata=running_score)
+            print('Upd Step {}\tLast score: {:.2f}\tMoving average score: {:.2f}\tLearning rate: {:.6f}'.format(agent.training_step, score, running_score, agent.optimizer.param_groups[0]["lr"]))
+            writer.add_scalar("Score/raw", score, agent.training_step)
+            writer.add_scalar("Score/running_avg", running_score, agent.training_step)
 
         if running_score > env.reward_threshold:
             print("Solved! Running reward is now {} and the last episode runs to {}!".format(running_score, score))
