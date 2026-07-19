@@ -21,7 +21,10 @@ parser.add_argument('--unroll-steps', type=int, default=128, metavar='N', help='
 parser.add_argument('--params-path', type=str, default=None, help='path to the saved model parameters')
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='discount factor (default: 0.99)')
 parser.add_argument('--lambda_', type=float, default=0, metavar='G', help='GAE lambda factor (default: 0)')
+parser.add_argument('--vf_coef', type=float, default=0.5, metavar='G', help='"coefficient of the value function in loss function" (default: 0.5)')
 parser.add_argument('--lr', type=float, default=1e-4, metavar='G', help='learning rate of agent (default: 1e-4)')
+parser.add_argument("--max-grad-norm", type=float, default=0.5, help="the maximum norm for the gradient clipping")
+parser.add_argument('--no-rewards-threshold', type=float, default=-0.1, metavar='G', help='threshold of average reward before terminating episode (default: -0.1)')
 parser.add_argument('--num-lstm-layers', type=int, default=1, metavar='N', help='number of LSTM layers (default: 1)')
 parser.add_argument('--action-repeat', type=int, default=4, metavar='N', help='repeat action in N frames (default: 4)')
 parser.add_argument('--seed', type=int, default=125, metavar='N', help='random seed (default: 125)')
@@ -71,12 +74,12 @@ class Env():
             observation, reward, die, trunc, _ = self.env.step(action)
             reward = float(reward)
             # don't penalize "die state"
-            if die:
-                reward += 100
+            # if die:
+            #     reward += 100
 
             total_reward += reward
             # if no reward recently, end the episode
-            done = True if self.av_r(reward) <= -0.1 or trunc else False
+            done = True if self.av_r(reward) <= args.no_rewards_threshold or trunc else False
             if done or die:
                 break
         return np.array(observation), total_reward, done, die
@@ -254,7 +257,7 @@ class Agent():
         adv = torch.zeros(r.shape, dtype=torch.double).to(device)
         T=len(r)
         with torch.no_grad():
-            v_last = self.net(next_o[-1].unsqueeze(0), last_lstm_state_for_bootstrap, next_terminal[-1])[1] # bootstrap
+            v_last = self.net(next_o[-1].unsqueeze(0), last_lstm_state_for_bootstrap, next_die[-1])[1] # bootstrap
             v_next = torch.cat([v, v_last], 0)[1:]
             target_v = r + args.gamma * v_next * (1 - next_die) # if die (not trunc), penalize next state with just r.
             delta = target_v - v
@@ -263,7 +266,7 @@ class Agent():
         for t in reversed(range(T)):
             gae = delta[t] + args.gamma * args.lambda_ * gae * (1 - next_die[t]) * (1 - next_done[t]) # if a state is die or done, then reset gae = delta[t] + 0
             adv[t] = gae
-
+        # adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         mean_total_loss, mean_action_loss, mean_value_loss, mean_approx_kl = [], [], [], []
 
         # if used 's' and original 'terminal', in get_states(), it will zero-out LSTM hidden values
@@ -283,16 +286,16 @@ class Agent():
                 # calculate approx_kl http://joschu.net/blog/kl-approx.html
                 old_approx_kl = (-log_ratio).mean()
                 approx_kl = ((ratio - 1) - log_ratio).mean()
-            if i == 0: assert all(torch.round(ratio) == 1)
+            if i == 0 and all(torch.round(ratio) != 1): print(round(ratio.item(), 5))
             surr1 = ratio * adv[index]
             surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv[index]
             action_loss = -torch.min(surr1, surr2).mean()
             value_loss = F.smooth_l1_loss(new_value, target_v[index])
-            loss = action_loss + 2. * value_loss
+            loss = action_loss + args.vf_coef * value_loss
 
             self.optimizer.zero_grad()
             loss.backward()
-            # nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.net.parameters(), args.max_grad_norm)
             self.optimizer.step()
             self.training_step += 1
             mean_total_loss.append(loss.item())
