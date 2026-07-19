@@ -15,6 +15,7 @@ from utils import DrawLine
 
 parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacing-v0')
 parser.add_argument('--model-name', type=str, help='model name used to save checkpoint.')
+parser.add_argument('--model', type=str, default='net', help='net or net2')
 parser.add_argument('--max-training-steps', type=int, default=10000, metavar='N', help='maximum number of training steps. incremented by 1 * ppo_epochs once buffer full (default: 10000)')
 parser.add_argument('--max-episode-steps', type=int, default=1500, metavar='N', help='maximum number of steps in an episode (default: 1500)')
 parser.add_argument('--ppo-epochs', type=int, default=5, metavar='N', help='(default: 5)')
@@ -196,6 +197,58 @@ class Net(nn.Module):
         beta = self.beta_head(hidden) + 1
         return (alpha, beta, lstm_state), v
 
+class Net2(Net):
+    def __init__(self):
+        super(Net2, self).__init__()
+        self.cnn_base = nn.Sequential(  # input shape (# channels, 96, 96)
+            nn.Conv2d(1, 32, kernel_size=8, stride=4),
+            nn.ReLU(),  # activation
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),  # activation
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),  # activation
+            nn.Flatten()
+        ) 
+        self.cnn_fc = nn.Sequential(nn.Linear(4096, 512), nn.ReLU()) # output shape: (1, 128)
+        self.lstm = nn.LSTM(512, 128, args.num_lstm_layers)
+        self.v = nn.Linear(128, 1)
+        self.alpha_head = nn.Sequential(nn.Linear(128, 3), nn.Softplus())
+        self.beta_head = nn.Sequential(nn.Linear(128, 3), nn.Softplus())
+
+        self.cnn_base.apply(self._cnn_weights_init)
+        self.cnn_fc.apply(self._cnn_weights_init)
+        
+        for name, param in self.lstm.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, 1.0)
+        self.v.apply(self._value_weights_init)
+        self.alpha_head.apply(self._policy_weights_init)
+        self.beta_head.apply(self._policy_weights_init)
+
+    def _get_states(self, x, lstm_state, done):
+         # x.shape = (seq_len, channel=1, 96, 96)
+        x = self.cnn_base(x) # (1, 4096, 1, 1)
+        x = x.reshape(x.shape[0], 1, 1, 4096)
+        x = self.cnn_fc(x) # x.shape = (1, 1, 1, 512)
+        # LSTM logic
+        batch_size = lstm_state[0].shape[1]
+        done = done.reshape((-1, batch_size)) # change from shape (1) to (1, 1)
+        new_hidden = []
+        for i, d in zip(x, done):
+            # nn.LSTM( input, (h_t-1, c_t-1) ) -> output, (h_t, c_t), where h = hidden and c = context/cell states
+            i, lstm_state = self.lstm(
+                i, # i.shape [1, 1, 512]
+                (
+                    (1.0 - d) * lstm_state[0],
+                    (1.0 - d) * lstm_state[1],
+                ),
+            )
+            new_hidden += [i]
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, lstm_state
+
 class Agent():
     """
     Agent for training
@@ -204,7 +257,12 @@ class Agent():
     clip_param = 0.1  # epsilon in clipped loss
     def __init__(self):
         self.training_step = 0
-        self.net = Net().double().to(device)
+        if args.model.lower() == 'net':
+            self.net = Net().double().to(device)
+        elif args.model.lower() == 'net2':
+            self.net = Net2().double().to(device)
+        else:
+            raise Exception('invalid model. choose net or net2.')
         self.buffer = np.empty(args.unroll_steps, dtype=transition)
         self.counter = 0
         self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr) # starting lr was 1e-3
