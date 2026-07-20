@@ -25,6 +25,7 @@ parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='disc
 parser.add_argument('--lambda_', type=float, default=0, metavar='G', help='GAE lambda factor (default: 0)')
 parser.add_argument('--vf_coef', type=float, default=0.5, metavar='G', help='"coefficient of the value function in loss function" (default: 0.5)')
 parser.add_argument('--lr', type=float, default=2.5e-4, metavar='G', help='learning rate of agent (default: 2.5e-4)')
+parser.add_argument('--lr-floor', type=float, default=None, metavar='G', help='lowest learning rate of agent during adaptive LR schedules (default: 0.25*lr)')
 parser.add_argument('--anneal-lr', action='store_true', default=False, help='Toggle learning rate annealing for policy and value networks')
 parser.add_argument("--max-grad-norm", type=float, default=0.5, help="the maximum norm for the gradient clipping")
 parser.add_argument('--no-rewards-threshold', type=float, default=-0.1, metavar='G', help='threshold of average reward before terminating episode (default: -0.1)')
@@ -41,7 +42,9 @@ args = parser.parse_args()
 
 run_name = f"{args.model_name}_{datetime.now().strftime('%b%d_%H%M')}"
 writer = SummaryWriter(log_dir=f"runs/{run_name}")
-
+lrnow = args.lr
+lr_floor = 0.25 * args.lr if args.lr_floor is None else args.lr_floor
+lr_ceil = args.lr
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 torch.manual_seed(args.seed)
@@ -284,7 +287,7 @@ class Agent():
         checkpoint = torch.load(path, map_location=device)
         self.net.load_state_dict(checkpoint['model_state_dict'])
         print(f'Loaded update_steps {checkpoint['update_steps']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
-        return checkpoint['update_steps'], checkpoint['best_score'], checkpoint['running_score'], checkpoint['seed']
+        return checkpoint['update_steps'], checkpoint['episode'], checkpoint['best_score'], checkpoint['running_score'], checkpoint['seed']
 
     def store(self, transition):
         self.buffer[self.counter] = transition
@@ -307,6 +310,7 @@ class Agent():
         return action, a_logp, lstm_state, value
     
     def update(self, lstm_state, last_lstm_state_for_bootstrap):
+        global lrnow
         o = torch.tensor(self.buffer['o'], dtype=torch.float32).to(device)
         a = torch.tensor(self.buffer['a'], dtype=torch.float32).to(device)
         r = torch.tensor(self.buffer['r'], dtype=torch.float32).to(device).view(-1, 1)
@@ -366,9 +370,10 @@ class Agent():
             mean_action_loss.append(action_loss.item())
             mean_value_loss.append(value_loss.item())
             mean_approx_kl.append(approx_kl.item())
-            if args.target_kl is not None:
-                if approx_kl > args.target_kl:
-                    print(approx_kl)
+            if args.target_kl is not None and approx_kl > args.target_kl:
+                print(f'KL exceeded target KL ({args.target_kl}) at epoch {i}: {approx_kl.item():.4f} - aborting update')
+                break
+
         with torch.no_grad():
             (_, _, latest_lstm_state), _ = self.net(o[index], lstm_state, terminal[index])
         writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
@@ -380,15 +385,17 @@ if __name__ == "__main__":
     agent = Agent()
     env = Env()
     running_score = 0
+    episode_num = 0
     best_score = float('-inf')
     best_running_score = float('-inf')
     if args.load_weights:
-        agent.training_step, best_score, loaded_running_score, loaded_seed = agent.load_param(args.params_path)
+        agent.training_step, loaded_episode, best_score, loaded_running_score, loaded_seed = agent.load_param(args.params_path)
         if loaded_seed != args.seed: 
             print (f'Loaded seed {loaded_seed} is different from input seed {args.seed}. Restart running score.')
         else:
             best_running_score = loaded_running_score
             running_score = loaded_running_score
+            episode_num = loaded_episode
     if args.vis:
         draw_reward = DrawLine(env="car", title="PPO", xlabel="Episode", ylabel="Moving averaged episode reward")
 
@@ -397,14 +404,14 @@ if __name__ == "__main__":
             torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.float32).to(device),
             torch.zeros(agent.net.lstm.num_layers, 1, agent.net.lstm.hidden_size, dtype=torch.float32).to(device),
         )  # hidden and context states
-    episode_num = 0
+    
     while agent.training_step < args.max_training_steps:
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (agent.training_step - 1.0) / args.max_training_steps
             lrnow = frac * args.lr
-            if lrnow <= 0.1 * args.lr:
-                lrnow = 0.1 * args.lr
+            if lrnow <= lr_floor:
+                lrnow = lr_floor
             agent.optimizer.param_groups[0]["lr"] = lrnow
         score = 0
         initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
