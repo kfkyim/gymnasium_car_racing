@@ -252,11 +252,9 @@ class Agent():
         with torch.no_grad():
             (alpha, beta, lstm_state), value = self.net(state, lstm_state, next_done)
         dist = Beta(alpha, beta)
-        action = dist.sample()
-        a_logp = dist.log_prob(action).sum(dim=1)
+        action = alpha / (alpha + beta)
         action = action.squeeze().cpu().numpy()
-        a_logp = a_logp.item()
-        return action, a_logp, lstm_state, value
+        return action
 
 if __name__ == "__main__":
     agent = Agent()
@@ -276,7 +274,7 @@ if __name__ == "__main__":
         next_done = torch.zeros(1).to(device)
         for t in range(args.max_episode_steps):
             # next_done and next_die tells you a new episode is starting after this timestep.
-            action, a_logp, next_lstm_state, value = agent.select_action_and_value(next_obs, next_lstm_state, next_done)
+            action = agent.select_action_and_value(next_obs, next_lstm_state, next_done)
             next_next_obs, reward, next_done, next_die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
             next_next_obs = next_next_obs.reshape(1, 96, 96)
             score += reward
