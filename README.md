@@ -1,6 +1,6 @@
 # PPO for CarRacing-v3 (Gymnasium)
 
-A personal fork of [xtma/pytorch_car_caring](https://github.com/xtma/pytorch_car_caring), modified and extended for learning purposes. This project trains a **Proximal Policy Optimization (PPO)** agent with a **Beta action distribution** to solve the continuous-control [CarRacing-v3](https://gymnasium.farama.org/environments/box2d/car_racing/) environment from Gymnasium (Box2D).
+A personal fork of [xtma/pytorch_car_caring](https://github.com/xtma/pytorch_car_caring), modified and extended for **personal learning purposes only**. This project trains a **Proximal Policy Optimization (PPO)** agent with a **Beta action distribution** to solve the continuous-control [CarRacing-v3](https://gymnasium.farama.org/environments/box2d/car_racing/) environment from Gymnasium (Box2D).
 
 ## Overview
 
