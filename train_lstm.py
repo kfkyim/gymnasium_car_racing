@@ -34,7 +34,7 @@ parser.add_argument('--action-repeat', type=int, default=4, metavar='N', help='r
 parser.add_argument('--seed', type=int, default=125, metavar='N', help='random seed (default: 125)')
 parser.add_argument('--scale-rewards', action='store_true', default=False, help='scale reward through NormalizeReward wrapper')
 parser.add_argument('--render', action='store_true', default=False, help='render the environment')
-parser.add_argument('--vis', action='store_true', help='use visdom')
+parser.add_argument('--no_vis', action='store_true',default=False, help='do not record onto tensorboard')
 parser.add_argument('--log-interval', type=int, default=5, metavar='N', help='interval between training status logs (default: 5)')
 parser.add_argument('--load-weights', action='store_true', help='load pre-trained weights')
 parser.add_argument("--target-kl", type=float, default=0.02, help="the target KL divergence threshold")
@@ -374,9 +374,10 @@ class Agent():
 
         with torch.no_grad():
             (_, _, latest_lstm_state), _ = self.net(o[index], lstm_state, terminal[index])
-        writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
-        writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
-        writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
+        if not args.no_vis:
+            writer.add_scalar("Loss/total", np.mean(mean_total_loss), self.training_step)
+            writer.add_scalar("Loss/action", np.mean(mean_action_loss), self.training_step)
+            writer.add_scalar("Loss/value", np.mean(mean_value_loss), self.training_step)
         return latest_lstm_state
 
 if __name__ == "__main__":
@@ -394,10 +395,11 @@ if __name__ == "__main__":
             best_running_score = loaded_running_score
             running_score = loaded_running_score
             episode_num = loaded_episode
+    
     run_name = f"{args.model_name}_{datetime.now().strftime('%b%d_%H%M')}"
     writer = SummaryWriter(log_dir=f"runs/{run_name}")
-    if args.vis:
-        draw_reward = DrawLine(env="car", title="PPO", xlabel="Episode", ylabel="Moving averaged episode reward")
+    # if args.vis:
+    #     draw_reward = DrawLine(env="car", title="PPO", xlabel="Episode", ylabel="Moving averaged episode reward")
 
     training_records = []
     next_lstm_state = (
@@ -448,15 +450,16 @@ if __name__ == "__main__":
             print(f"New best running score: {best_running_score:.2f}, saved model parameters.\nBest score so far: {best_score:.2f}")
 
         if episode_num % args.log_interval == 0:
-            if args.vis:
-                draw_reward(xdata=agent.training_step, ydata=running_score)
+            if not args.no_vis:
+                writer.add_scalar("Score/raw", score, agent.training_step)
+                writer.add_scalar("Score/running_avg", running_score, agent.training_step)
             print('Episode {}\tUpd Step {}\tLast score: {:.2f}\tMoving average score: {:.2f}\tLearning rate: {:.6f}'.format(episode_num,agent.training_step, score, running_score, agent.optimizer.param_groups[0]["lr"]))
-            writer.add_scalar("Score/raw", score, agent.training_step)
-            writer.add_scalar("Score/running_avg", running_score, agent.training_step)
+            
 
         if running_score > env.reward_threshold:
             print("Solved! Running reward is now {} and the last episode runs to {}!".format(running_score, score))
             break
 
-    writer.add_hparams(vars(args), {"best_score": best_score, "best_running": best_running_score})
-    writer.close()
+    if not args.no_vis:
+        writer.add_hparams(vars(args), {"best_score": best_score, "best_running": best_running_score})
+        writer.close()
