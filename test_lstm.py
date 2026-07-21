@@ -24,14 +24,7 @@ args = parser.parse_args()
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-if use_cuda:
-    torch.cuda.manual_seed(args.seed)
-    # These would absolutely make the training deterministic, but they would also slow down the training. Useful for debugging/tuning but not for actual training.
-    torch.backends.cudnn.deterministic = True   # force cuDNN to pick a deterministic algorithm
-    torch.backends.cudnn.benchmark = False       # prevents the auto-tuner from overriding that choice and selecting a nondeterministic algorithm that would be faster
-    
+
 class Env():
     """
     Environment wrapper for CarRacing 
@@ -42,11 +35,16 @@ class Env():
         spec = gym.spec('CarRacing-v3')
         self.reward_threshold = spec.reward_threshold if spec.reward_threshold else float('inf')
         self.max_episode_steps = spec.max_episode_steps if spec.max_episode_steps else float('inf')
+        self.first_episode = True
 
     def reset(self):
-        self.counter = 0
         self.av_r = self.reward_memory()
-        observation, _ = self.env.reset(seed=args.seed)
+        self.rng = np.random.default_rng(args.seed + 1)
+        if self.first_episode: # play specified seed for first episode then random afterwards
+            observation, _ = self.env.reset(seed=args.seed)
+            self.first_episode = False
+        else:
+            observation, _ = self.env.reset()
         return np.array(observation)
 
     def step(self, action):
@@ -244,6 +242,15 @@ class Agent():
             raise Exception('No model path provided.')
         checkpoint = torch.load(path, map_location=device)
         self.net.load_state_dict(checkpoint['model_state_dict'])
+        if 'obs_rms_mean' in checkpoint:
+            # Restore the observation normalizer's running statistics saved at training time.
+            # Without this, NormalizeObservation starts with fresh (default) mean/var, so the
+            # policy receives differently-scaled inputs than it was trained on and degrades.
+            env.env.obs_rms.mean = checkpoint['obs_rms_mean'].cpu().numpy().astype(np.float64)
+            env.env.obs_rms.var = checkpoint['obs_rms_var'].cpu().numpy().astype(np.float64)
+            env.env.obs_rms.count = checkpoint['obs_rms_count']
+        else:
+            print('Warning: no obs_rms stats in checkpoint; using fresh normalization stats.')
         print(f'Loaded update_steps {checkpoint['update_steps']}      Best_score {checkpoint['best_score']:.2f}      Best_running_score {checkpoint['running_score']:.2f}')
         return checkpoint['update_steps'], checkpoint['episode'], checkpoint['best_score'], checkpoint['running_score'], checkpoint['seed']
     
@@ -251,10 +258,9 @@ class Agent():
         state = torch.from_numpy(state).float().to(device).unsqueeze(0) # converts shape to (seq_len=1, channels=1, 96, 96)
         with torch.no_grad():
             (alpha, beta, lstm_state), value = self.net(state, lstm_state, next_done)
-        dist = Beta(alpha, beta)
         action = alpha / (alpha + beta)
         action = action.squeeze().cpu().numpy()
-        return action
+        return action, lstm_state
 
 if __name__ == "__main__":
     agent = Agent()
@@ -274,7 +280,7 @@ if __name__ == "__main__":
         next_done = torch.zeros(1).to(device)
         for t in range(args.max_episode_steps):
             # next_done and next_die tells you a new episode is starting after this timestep.
-            action = agent.select_action_and_value(next_obs, next_lstm_state, next_done)
+            action, next_lstm_state = agent.select_action_and_value(next_obs, next_lstm_state, next_done)
             next_next_obs, reward, next_done, next_die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
             next_next_obs = next_next_obs.reshape(1, 96, 96)
             score += reward

@@ -275,7 +275,15 @@ class Agent():
                 'episode': episode,
                 'best_score': float(score),
                 'running_score': float(running_score),
-                'seed': float(args.seed)
+                'seed': float(args.seed),
+                # Save the observation normalizer's running statistics saved at training time.
+                # Without this, NormalizeObservation in the test loop starts with fresh (default)
+                # mean/var, so the policy receives differently-scaled inputs than it was trained
+                # on and degrades.
+                'obs_rms_mean': torch.as_tensor(env.env.obs_rms.mean, dtype=torch.float32),
+                'obs_rms_var': torch.as_tensor(env.env.obs_rms.var, dtype=torch.float32),
+                'obs_rms_count': float(env.env.obs_rms.count),
+                'args': vars(args),  # record exact hyperparameters with the weights
             }
         torch.save(checkpoint, f'checkpoints/{args.model_name}.pkl')
 
@@ -443,11 +451,11 @@ if __name__ == "__main__":
         running_score = running_score * 0.99 + score * 0.01
         if score > best_score:
             best_score = score
-
-        if running_score > best_running_score:
+            
+        if running_score > best_running_score and score > 0.95 * running_score:
             best_running_score = running_score
             agent.save_param(agent.training_step, episode_num, score, best_running_score)
-            print(f"New best running score: {best_running_score:.2f}, saved model parameters.\nBest score so far: {best_score:.2f}")
+            print(f"New best running score: {best_running_score:.2f}, saved model parameters.\nScore of model saved: {score:.2f}")
 
         if episode_num % args.log_interval == 0:
             if not args.no_vis:
